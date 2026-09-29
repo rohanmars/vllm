@@ -7,10 +7,14 @@ n-gram embedding table can be kept in pinned host memory and looked up through
 Unified Virtual Addressing on any CUDA-alike platform.
 """
 
+import contextlib
+import mmap
 import threading
+import weakref
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -42,6 +46,7 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -49,6 +54,62 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from .ple import PLEVocabParallelEmbedding
 
 logger = init_logger(__name__)
+
+_CUDA_HOST_REGISTER_PORTABLE = 0x01
+_CUDA_HOST_REGISTER_MAPPED = 0x02
+
+
+def _cuda_host_unregister(mapping: mmap.mmap, pointer: int) -> None:
+    # The finalizer holds the mapping, so it is unmapped only after this runs.
+    err = torch.cuda.cudart().cudaHostUnregister(pointer)
+    if err.value != 0:
+        logger.warning(
+            "cudaHostUnregister of the PLE table failed: cudaError %d", err.value
+        )
+
+
+def _allocate_registered_host_tensor(
+    num_embeddings: int, embedding_dim: int, dtype: torch.dtype
+) -> torch.Tensor | None:
+    """Allocate a CPU tensor whose exact (page-rounded) size is pinned.
+
+    Returns None if the memory could not be registered with CUDA.
+    """
+    num_bytes = num_embeddings * embedding_dim * dtype.itemsize
+    try:
+        mapping = mmap.mmap(-1, num_bytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    except OSError as exc:
+        logger.warning("PLE table mmap failed (%s); using pinned memory.", exc)
+        return None
+    if hasattr(mmap, "MADV_HUGEPAGE"):
+        with contextlib.suppress(OSError):
+            mapping.madvise(mmap.MADV_HUGEPAGE)
+    owner = np.frombuffer(mapping, dtype=np.uint8)
+    tensor = torch.from_numpy(owner)
+    pointer = tensor.data_ptr()
+    err = torch.cuda.cudart().cudaHostRegister(
+        pointer,
+        num_bytes,
+        _CUDA_HOST_REGISTER_PORTABLE | _CUDA_HOST_REGISTER_MAPPED,
+    )
+    if err.value != 0:
+        logger.warning(
+            "cudaHostRegister of the PLE table failed (cudaError %d); "
+            "using pinned memory.",
+            err.value,
+        )
+        return None
+    # The tensor storage keeps owner alive. Once it is freed, unregister before
+    # the mapping is released, or a later allocation reusing the range fails
+    # with cudaErrorHostMemoryAlreadyRegistered.
+    finalizer = weakref.finalize(owner, _cuda_host_unregister, mapping, pointer)
+    finalizer.atexit = False  # type: ignore[misc]
+    if not tensor.is_pinned():
+        logger.warning(
+            "CUDA did not recognize the PLE table registration; using pinned memory."
+        )
+        return None
+    return tensor.view(dtype).view(num_embeddings, embedding_dim)
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
@@ -438,6 +499,14 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         """Allocate the complete PLE weight directly in pinned CPU memory."""
+        # On CUDA, register exactly the table's pages; pin_memory=True rounds up
+        # to a power of two. An empty table has nothing to register.
+        if current_platform.is_cuda() and num_embeddings * embedding_dim > 0:
+            weight = _allocate_registered_host_tensor(
+                num_embeddings, embedding_dim, dtype
+            )
+            if weight is not None:
+                return weight
         return torch.empty(
             num_embeddings,
             embedding_dim,

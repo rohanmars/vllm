@@ -179,6 +179,8 @@ steps:
   - tests/models/qwen4_exp/
   commands:
     - pytest -v -s models/qwen4_exp/test_hc_ops.py models/qwen4_exp/test_qsa_prepare.py models/qwen4_exp/test_qsa_reference.py
+    # Separate process: the PLE module registers HC ops that conflict with QSA's.
+    - pytest -v -s models/qwen4_exp/test_ple_pinned_exact_size.py
   mirror:
     amd:
       label: ":amd: (MI355 DPX) Qwen4 Exp"
